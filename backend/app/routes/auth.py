@@ -1,67 +1,51 @@
 # app/routes/auth.py
+"""Authentication endpoints."""
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token
-from werkzeug.security import generate_password_hash, check_password_hash
-from app.models import User
-from app import db
+from app.services import AuthService
+from app.utils import ValidationError, AuthenticationError, ConflictError, format_error_response
 
 auth_bp = Blueprint("auth", __name__)
 
 
 @auth_bp.post("/register")
 def register():
-    data = request.get_json()
+    """Register a new user."""
+    try:
+        data = request.get_json()
+        if not data:
+            return format_error_response("Request body is required", 400)
 
-    # Validate required fields
-    required = ["name", "email", "password"]
-    missing = [f for f in required if not data.get(f)]
-    if missing:
-        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+        user = AuthService.register_user(data)
+        return jsonify({
+            "message": "User created successfully",
+            "user": user
+        }), 201
 
-    # Check if email already exists
-    if User.query.filter_by(email=data["email"]).first():
-        return jsonify({"error": "Email already registered"}), 409
-
-    user = User(
-        name=data["name"],
-        email=data["email"],
-        password=generate_password_hash(data["password"]),
-        role=data.get("role", "candidate"),  # candidate | recruiter | admin
-    )
-    db.session.add(user)
-    db.session.commit()
-
-    return jsonify({
-        "message": "User created successfully",
-        "user": {
-            "id":    user.id,
-            "name":  user.name,
-            "email": user.email,
-            "role":  user.role,
-        }
-    }), 201
+    except ValidationError as e:
+        return format_error_response(str(e), 400)
+    except ConflictError as e:
+        return format_error_response(str(e), 409)
+    except Exception as e:
+        return format_error_response(f"Registration failed: {str(e)}", 500)
 
 
 @auth_bp.post("/login")
 def login():
-    data = request.get_json()
+    """Authenticate user and return JWT token."""
+    try:
+        data = request.get_json()
+        if not data:
+            return format_error_response("Request body is required", 400)
 
-    if not data.get("email") or not data.get("password"):
-        return jsonify({"error": "Email and password are required"}), 400
+        result = AuthService.authenticate_user(
+            email=data.get("email"),
+            password=data.get("password")
+        )
+        return jsonify(result), 200
 
-    user = User.query.filter_by(email=data["email"]).first()
-
-    if not user or not check_password_hash(user.password, data["password"]):
-        return jsonify({"error": "Invalid email or password"}), 401
-
-    token = create_access_token(identity=str(user.id))
-
-    return jsonify({
-        "access_token": token,
-        "user": {
-            "id":    user.id,
-            "name":  user.name,
-            "email": user.email,
-            "role":  user.role,
-        }
-    }), 200
+    except ValidationError as e:
+        return format_error_response(str(e), 400)
+    except AuthenticationError as e:
+        return format_error_response(str(e), 401)
+    except Exception as e:
+        return format_error_response(f"Login failed: {str(e)}", 500)

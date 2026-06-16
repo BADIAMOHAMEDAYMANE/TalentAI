@@ -1,92 +1,87 @@
 # routes/cv.py
-from flask import Blueprint, request, jsonify, current_app
+"""CV upload and candidate ranking endpoints."""
+from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from app.models import CandidateProfile
-from app import db
-from app.services.parser.nlp import parse_cv
-from app.services.parser.extractor import extract_text
+from app.services import CandidateService, RankingService
+from app.utils import NotFoundError, ValidationError, BadRequestError, format_error_response
 
-from app.services.ranking.tfidf import rank_candidates_tfidf
-from app.services.ranking.semantic import rank_candidates_semantic
+cv_bp = Blueprint("cv", __name__)
 
-cv_bp = Blueprint("cv", __name__)  
 
 @cv_bp.post("/upload")
 @jwt_required()
 def upload_cv():
-    user_id = get_jwt_identity()
-    if "cv" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-        
-    file    = request.files["cv"]
-    path    = f"/tmp/{file.filename}"
-    file.save(path)
+    """Upload and parse CV file."""
+    try:
+        user_id = get_jwt_identity()
 
-    text   = extract_text(path)
-    parsed = parse_cv(text)
+        if "cv" not in request.files:
+            return format_error_response("No file uploaded", 400)
 
-    profile = CandidateProfile.query.filter_by(user_id=user_id).first()
-    if not profile:
-        profile = CandidateProfile(user_id=user_id)
-        db.session.add(profile)
+        file = request.files["cv"]
+        if not file.filename:
+            return format_error_response("Empty filename", 400)
 
-    profile.skills     = parsed["skills"]
-    profile.experience = parsed["experience"]
-    profile.education  = parsed["education"]
-    profile.cv_text    = text
-    profile.cv_path    = path
-    db.session.commit()
+        # Save file
+        path = f"/tmp/{file.filename}"
+        file.save(path)
 
-    return jsonify(parsed), 201
+        # Process CV and store in database
+        parsed = CandidateService.process_and_store_cv(int(user_id), path)
+
+        return jsonify(parsed), 201
+
+    except NotFoundError as e:
+        return format_error_response(str(e), 404)
+    except ValidationError as e:
+        return format_error_response(str(e), 400)
+    except Exception as e:
+        return format_error_response(f"CV upload failed: {str(e)}", 500)
 
 
 @cv_bp.post("/rank")
 @jwt_required()
 def rank_candidates():
-    """
-    Endpoint pour classer les candidats par rapport à une description de poste (Job Description).
-    Prend en entrée un JSON contenant la 'job_description' et la 'method' souhaitée ('tfidf' ou 'semantic').
-    """
-    data = request.get_json()
-    
-    if not data or "job_description" not in data:
-        return jsonify({"error": "Missing 'job_description' in request body"}), 400
-        
-    job_description = data["job_description"]
-    method = data.get("method", "tfidf").lower()
+    """Rank candidates by job description using specified algorithm."""
+    try:
+        data = request.get_json()
 
-    profiles = CandidateProfile.query.all()
-    if not profiles:
-        return jsonify({"message": "No candidates found in database", "candidates": []}), 200
+        if not data:
+            return format_error_response("Request body is required", 400)
 
-    candidates_list = [
-        {
-            "user_id": p.user_id,
-            "skills": p.skills,
-            "experience": p.experience,
-            "education": p.education,
-            "text": p.cv_text  
-        }
-        for p in profiles if p.cv_text 
-    ]
+        job_description = data.get("job_description")
+        method = data.get("method", "tfidf").lower()
 
-    if method == "semantic":
-        ranked_list = rank_candidates_semantic(job_description, candidates_list)
-        
-    elif method == "tfidf":
-        ranked_list = rank_candidates_tfidf(job_description, candidates_list)
-    else:
-        return jsonify({"error": f"Unknown ranking method '{method}'. Use 'tfidf' or 'semantic'."}), 400
+        if not job_description:
+            return format_error_response("'job_description' is required", 400)
 
-    # Sécurité au cas où l'algorithme de ranking retournerait None
-    if not ranked_list:
-        ranked_list = []
+        # Get all candidates with CV text
+        candidates = CandidateService.get_all_candidates_for_ranking()
 
-    for candidate in ranked_list:
-        candidate.pop("text", None)
+        if not candidates:
+            return jsonify({
+                "message": "No candidates found in database",
+                "method_used": method,
+                "total_candidates": 0,
+                "ranking": []
+            }), 200
 
-    return jsonify({
-        "method_used": method,
-        "total_candidates": len(ranked_list),
-        "ranking": ranked_list
-    }), 200
+        # Rank candidates
+        ranked_list = RankingService.rank_candidates(job_description, candidates, method)
+
+        # Remove sensitive cv_text from response
+        for candidate in ranked_list:
+            candidate.pop("text", None)
+
+        return jsonify({
+            "method_used": method,
+            "total_candidates": len(ranked_list),
+            "ranking": ranked_list
+        }), 200
+
+    except ValidationError as e:
+        return format_error_response(str(e), 400)
+    except BadRequestError as e:
+        return format_error_response(str(e), 400)
+    except Exception as e:
+        return format_error_response(f"Ranking failed: {str(e)}", 500)
